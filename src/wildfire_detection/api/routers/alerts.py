@@ -3,18 +3,25 @@ Alerts router — GET /api/alerts, GET /api/alerts/history
 """
 
 import json
+import time
+import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 import h3
-from fastapi import APIRouter, Depends, Query, HTTPException
+import requests
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from ..dependencies import get_db
 from ..schemas import AlertItem, AlertsResponse, AlertHistoryItem, AlertHistoryResponse
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+NOMINATIM_HEADERS = {"User-Agent": "WildfireDetectionAPI/1.0"}
 
 
 def _parse_coherence_reasons(raw) -> list:
@@ -33,8 +40,56 @@ def _get_cell_coords(h3_index: str):
     return lat, lng
 
 
+def _geocode_and_save(h3_index: str, lat: float, lng: float, db_url: str):
+    """
+    Background task: reverse-geocode a new H3 cell and persist to h3_cell_metadata.
+    Called only when province is missing — writes province/regency/district/coords.
+    """
+    try:
+        time.sleep(1)  # Nominatim rate limit
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"lat": lat, "lon": lng, "format": "json", "addressdetails": 1},
+            headers=NOMINATIM_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "error" in data:
+            logger.debug(f"Nominatim: no result for {h3_index}")
+            return
+
+        addr = data.get("address", {})
+        province = addr.get("state")
+        regency  = addr.get("county") or addr.get("city")
+        district = addr.get("suburb") or addr.get("town") or addr.get("village")
+
+        from sqlalchemy import create_engine
+        engine = create_engine(db_url)
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO h3_cell_metadata (h3_index, center_lat, center_lng, province, regency, district, updated_at)
+                VALUES (:h3, :lat, :lng, :province, :regency, :district, NOW())
+                ON CONFLICT (h3_index) DO UPDATE SET
+                    province   = COALESCE(EXCLUDED.province,  h3_cell_metadata.province),
+                    regency    = COALESCE(EXCLUDED.regency,   h3_cell_metadata.regency),
+                    district   = COALESCE(EXCLUDED.district,  h3_cell_metadata.district),
+                    center_lat = EXCLUDED.center_lat,
+                    center_lng = EXCLUDED.center_lng,
+                    updated_at = NOW()
+            """), {"h3": h3_index, "lat": lat, "lng": lng,
+                   "province": province, "regency": regency, "district": district})
+
+        logger.info(f"Geocoded new cell {h3_index[:12]}... → {province}, {regency}")
+
+    except Exception as e:
+        logger.warning(f"Background geocode failed for {h3_index}: {e}")
+
+
 @router.get("", response_model=AlertsResponse)
 def get_alerts(
+    background_tasks: BackgroundTasks,
     date: Optional[date] = Query(default=None, description="Date (YYYY-MM-DD). Defaults to latest available."),
     k: int = Query(default=20, ge=1, le=100, description="Number of alerts to return"),
     coherence: Optional[str] = Query(default=None, description="Filter by coherence level: high, medium, low, isolated"),
@@ -78,13 +133,22 @@ def get_alerts(
     if not rows:
         raise HTTPException(status_code=404, detail=f"No alerts found for date {date}")
 
+    # Collect cells with missing geocoding so we can enrich them in background
+    from ..dependencies import DATABASE_URL as _db_url
+
     alerts = []
+    cells_to_geocode = []
+
     for row in rows:
         # Fallback: calc coords from H3 if not in metadata yet
         lat = row.center_lat
         lng = row.center_lng
         if lat is None:
             lat, lng = _get_cell_coords(row.h3_index)
+
+        # Schedule background geocoding for cells missing province
+        if row.province is None:
+            cells_to_geocode.append((row.h3_index, lat, lng))
 
         alerts.append(AlertItem(
             rank=row.rank,
@@ -104,6 +168,13 @@ def get_alerts(
             province=row.province,
             regency=row.regency,
         ))
+
+    # Enrich unmapped cells in background (non-blocking — response goes out immediately)
+    for h3_idx, lat, lng in cells_to_geocode:
+        background_tasks.add_task(_geocode_and_save, h3_idx, lat, lng, _db_url)
+
+    if cells_to_geocode:
+        logger.info(f"Queued {len(cells_to_geocode)} cells for background geocoding")
 
     return AlertsResponse(date=date, total_alerts=len(alerts), alerts=alerts)
 

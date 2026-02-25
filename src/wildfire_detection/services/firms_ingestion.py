@@ -10,7 +10,7 @@ from typing import List, Optional
 import h3
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
-from models import RawHotspot  # Your SQLAlchemy model
+from wildfire_detection.models import RawHotspot  # SQLAlchemy model
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -134,7 +134,8 @@ class FIRMSIngester:
     
     def validate_hotspot(self, row: pd.Series) -> bool:
         """
-        Validate hotspot data
+        Validate hotspot data.
+        Handles both VIIRS letter confidence (l/n/h) and MODIS integer confidence (0-100).
         
         Args:
             row: DataFrame row
@@ -152,8 +153,11 @@ class FIRMSIngester:
         if pd.isna(row['frp']) or row['frp'] < 0:
             return False
         
-        # Check confidence
-        if row['confidence'] not in ['l', 'n', 'h']:  # low, nominal, high
+        # Check confidence — VIIRS uses letters (l/n/h), MODIS uses integers
+        conf = row['confidence']
+        if isinstance(conf, str) and conf.lower() not in ['l', 'n', 'h']:
+            return False
+        if isinstance(conf, (int, float)) and not (0 <= conf <= 100):
             return False
         
         return True
@@ -176,22 +180,25 @@ class FIRMSIngester:
         datetime_str = f"{date_str} {time_str[:2]}:{time_str[2:]}"
         return datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
     
-    def confidence_to_int(self, confidence: str) -> int:
+    def confidence_to_int(self, confidence) -> int:
         """
-        Convert confidence letter to integer
+        Convert confidence to integer (0-100).
+        Handles VIIRS letter format (l/n/h) and MODIS integer format.
         
         Args:
-            confidence: 'l', 'n', or 'h'
+            confidence: 'l'/'n'/'h' or integer 0-100
             
         Returns:
             Integer confidence (0-100)
         """
+        if isinstance(confidence, (int, float)):
+            return int(confidence)
         mapping = {
             'l': 30,   # low
-            'n': 50,   # nominal
-            'h': 100   # high
+            'n': 60,   # nominal
+            'h': 95,   # high
         }
-        return mapping.get(confidence, 50)
+        return mapping.get(str(confidence).lower(), 50)
     
     def ingest_dataframe(self, df: pd.DataFrame) -> int:
         """
@@ -216,10 +223,10 @@ class FIRMSIngester:
                 # Parse datetime
                 acq_datetime = self.parse_acquisition_datetime(row)
                 
-                # Calculate H3 index
-                h3_index = h3.geo_to_h3(
-                    row['latitude'],
-                    row['longitude'],
+                # Calculate H3 index (modern h3 API)
+                h3_index = h3.latlng_to_cell(
+                    float(row['latitude']),
+                    float(row['longitude']),
                     self.h3_resolution
                 )
                 
